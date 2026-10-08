@@ -21,6 +21,11 @@ build = "data/join.rs"
 clap = ["dep:clap"]
 inspector = []
 rawdb = ["dep:ureq", "dep:percent-encoding"]
+# Nikon High Efficiency (HE/HE*) NEF decoding through a JPEG XS decoder.
+# Off by default: JPEG XS is covered by a patent pool that licenses
+# decoders per copy, so a build that ships to others may not want it.
+# Without it an HE file fails with the same error as before.
+jpegxs = []
 
 [dependencies]
 backtrace = "0.3"

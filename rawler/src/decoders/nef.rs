@@ -21,6 +21,7 @@ use crate::decoders::dynamic_image_from_ifd;
 use crate::decoders::dynamic_image_from_jpeg_interchange_format;
 use crate::decoders::nef::lensdata::NefLensData;
 use crate::decompressors::decompress_lines_fn;
+#[cfg(feature = "jpegxs")]
 use crate::decompressors::jpegxs;
 use crate::decompressors::ljpeg::huffman::HuffTable;
 use crate::decompressors::packed::*;
@@ -203,6 +204,13 @@ impl<'a> Decoder for NefDecoder<'a> {
     };
     debug!("TIFF compression flag: {}, NEF compression mode: {:?}", compression, nef_compression);
 
+    // Without the JPEG XS decoder HE and HE* are refused here, before
+    // the strip is read, as they always were.
+    #[cfg(not(feature = "jpegxs"))]
+    if matches!(nef_compression, Some(NefCompression::HighEfficency)) || matches!(nef_compression, Some(NefCompression::HighEfficencyStar)) {
+      return Err(RawlerError::DecoderFailed(format!("NEF compression {:?} is not supported", nef_compression)));
+    }
+
     let offset = fetch_tiff_tag!(raw, TiffCommonTag::StripOffsets).force_usize(0);
     let size = fetch_tiff_tag!(raw, TiffCommonTag::StripByteCounts).force_usize(0);
     let rows_per_strip = fetch_tiff_tag!(raw, TiffCommonTag::RowsPerStrip).get_usize(0).ok().flatten().unwrap_or(height);
@@ -284,7 +292,7 @@ impl<'a> Decoder for NefDecoder<'a> {
       // HE and HE* store the CFA data as a JPEG XS codestream with Nikon's
       // vendor deviations. Black (MakerNote 0x003d) and white (14-bit) levels
       // come from the same places as for lossless files.
-      self.decode_high_efficiency(&src, width, height, dummy)?
+      self.decode_high_efficiency(&src, width, height, nef_compression, dummy)?
     } else if compression == 34713 {
       self.decode_compressed(&src, width, height, bps, dummy)?
     } else {
@@ -583,7 +591,8 @@ impl<'a> NefDecoder<'a> {
   /// Decode a "High Efficiency" (HE/HE*) raw strip: a JPEG XS codestream
   /// carrying a star-tetrix decorrelation of the CFA planes, which
   /// [`jpegxs::decode`] reassembles into the full-resolution RGGB mosaic.
-  fn decode_high_efficiency(&self, src: &PaddedBuf, width: usize, height: usize, dummy: bool) -> Result<PixU16> {
+  #[cfg(feature = "jpegxs")]
+  fn decode_high_efficiency(&self, src: &PaddedBuf, width: usize, height: usize, _mode: Option<NefCompression>, dummy: bool) -> Result<PixU16> {
     if dummy {
       return Ok(PixU16::new_uninit(width, height));
     }
@@ -595,6 +604,14 @@ impl<'a> NefDecoder<'a> {
       )));
     }
     Ok(PixU16::new_with(mosaic, w, h))
+  }
+
+  /// Without the `jpegxs` feature HE and HE* are refused before the strip
+  /// is read, so this is not reached; it keeps the dispatch above the same
+  /// in both builds, and refuses with the same words if it ever is.
+  #[cfg(not(feature = "jpegxs"))]
+  fn decode_high_efficiency(&self, _src: &PaddedBuf, _width: usize, _height: usize, mode: Option<NefCompression>, _dummy: bool) -> Result<PixU16> {
+    Err(RawlerError::DecoderFailed(format!("NEF compression {:?} is not supported", mode)))
   }
 
   fn decode_compressed(&self, src: &PaddedBuf, width: usize, height: usize, bps: usize, dummy: bool) -> std::result::Result<PixU16, String> {
