@@ -18,16 +18,19 @@
 //!   wants `(Y, Cb, Cr, Δ)`, so they are permuted `0312`;
 //! * the coded samples are square-root companded rather than sensor values,
 //!   and are decompanded at the very end as `x = (v + V0)² / D + C`, with
-//!   `V0 = 16158`, `D = 191488` and `C = 1050`, close to the 1008 black
-//!   level, clamped to the component depth. That replaces the standard linear
+//!   `V0 = 16158`, `D = 191488` and `C = 1050`, and below a toe as the
+//!   straight line tangent to that square, which passes through the 1008
+//!   black level at `v = -V0` and continues below it (see [`NLT_TOE`]);
+//!   clamped to the component depth. That replaces the standard linear
 //!   `(v + 2^(Bw-1) + 2^(Fq-1)) >> Fq` output scaling. `v` is the
 //!   [`super::dwt`] output after the inverse colour transform, still in the
 //!   zero-centred `Bw` domain.
 //!
 //! The chroma gains and the three companding constants are fitted against
 //! lossless shots of a single scene rather than read from the stream, so they
-//! are probably about right rather than exact. Whether they hold for other
-//! cameras is untested.
+//! are probably about right rather than exact; the toe is fitted to the dark
+//! end of a set of Z6 III frames. Whether they hold for other cameras is
+//! untested.
 
 use super::header::Header;
 use crate::RawlerError;
@@ -42,6 +45,22 @@ const CR_GAIN: i64 = 4178; // 1.0200
 const NLT_V0: i64 = 16158;
 const NLT_D: i64 = 191488;
 const NLT_C: i64 = 1050;
+
+/// Where the square hands over to a straight line, in `t = v + V0`.
+///
+/// The codestream carries samples below `t = 0`: 12 to 17% of them at ISO
+/// 8000 and above on a Z6 III, continuing smoothly through zero, and the
+/// darkest tiles are as symmetric in `t` as read noise is around black. So
+/// the encoder's curve is close to linear near black, as in JPEG XS's
+/// extended non-linearity, whose middle piece is linear and meets the
+/// quadratic above it with a matching slope. Below `NLT_TOE` the decoder
+/// follows the tangent to the square at `NLT_TOE`, down through zero and
+/// below. `NLT_TOE` is fitted, not read from the stream: it is the one
+/// tangent that passes through the 1008 black level at `t = 0`
+/// (`NLT_TOE² = D (C - 1008)`), and with it the darkest tiles of night
+/// frames at ISO 100 to 40000 average 999 to 1016 with no skew, where the
+/// clamp at `t = 0` left them at 1051 to 1103.
+const NLT_TOE: i64 = 2836;
 
 /// Displacement of each spec-order component on the CFA grid (ISO/IEC 21122-1
 /// Table F.10, CFA pattern type 0): `(Δx, Δy)` for `(Y, Cb, Cr, Δ)`.
@@ -161,8 +180,13 @@ fn scale_chroma(plane: &mut [i32], gain: i64) {
 /// sensor value clamped to `depth` bits.
 #[inline]
 fn decompand(v: i32, max: i64) -> u16 {
-  let t = (v as i64 + NLT_V0).max(0);
-  let x = (t * t + NLT_D / 2) / NLT_D + NLT_C;
+  let t = v as i64 + NLT_V0;
+  let x = if t >= NLT_TOE {
+    (t * t + NLT_D / 2) / NLT_D + NLT_C
+  } else {
+    // C + (2 TOE t - TOE²) / D: the tangent at TOE, rounded to nearest.
+    (2 * NLT_TOE * t - NLT_TOE * NLT_TOE + NLT_D / 2).div_euclid(NLT_D) + NLT_C
+  };
   x.clamp(0, max) as u16
 }
 
@@ -246,15 +270,41 @@ mod tests {
   fn decompands_known_values() {
     // v = 0 sits near mid-grey: (16158² + 95744) / 191488 + 1050.
     assert_eq!(decompand(0, 16383), 2413);
-    // The zero level of the compander: t = 0 collapses to the C offset.
-    assert_eq!(decompand(-16158, 16383), 1050);
-    // Anything below is clamped before squaring, not folded back up.
-    assert_eq!(decompand(-100_000, 16383), 1050);
+    // The square's zero, t = 0, is black on the toe's line.
+    assert_eq!(decompand(-16158, 16383), 1008);
+    // The toe: square and line meet at t = NLT_TOE, C + TOE² / D.
+    assert_eq!(decompand((NLT_TOE - NLT_V0) as i32, 16383), 1092);
+    // Below black the line goes on, 0.0296 DN a step, and stops at 0.
+    assert_eq!(decompand(-16158 - 10_000, 16383), 712);
+    assert_eq!(decompand(-100_000, 16383), 0);
     // Large values clamp to the component depth.
     assert_eq!(decompand(100_000, 16383), 16383);
     // The largest value that still decompands below the clamp.
     assert_eq!(decompand(38_026, 16383), 16382);
     assert_eq!(decompand(38_027, 16383), 16383);
+  }
+
+  #[test]
+  fn the_curve_rises_through_the_toe_without_a_step_or_a_floor() {
+    // Never falls, never jumps more than the square's own slope (under one
+    // DN a code anywhere below white), and has no floor above 0: every
+    // value from 0 up to the toe is reached.
+    let mut last = decompand(-200_000, 16383);
+    let mut seen = vec![false; 16384];
+    for v in -200_000..40_000 {
+      let x = decompand(v, 16383);
+      assert!(x >= last, "falls at v = {}", v);
+      assert!(x - last <= 1, "jumps at v = {}", v);
+      seen[x as usize] = true;
+      last = x;
+    }
+    assert!(seen[..1093].iter().all(|&s| s), "a value below the toe is never produced");
+    // Slopes match at the toe: the step over the last 200 codes of the
+    // line and the first 200 of the square differ by at most a rounding.
+    let toe = (NLT_TOE - NLT_V0) as i32;
+    let below = decompand(toe, 16383) as i32 - decompand(toe - 200, 16383) as i32;
+    let above = decompand(toe + 200, 16383) as i32 - decompand(toe, 16383) as i32;
+    assert!((below - above).abs() <= 1, "{} against {}", below, above);
   }
 
   #[test]
