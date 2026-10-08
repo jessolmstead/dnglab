@@ -18,7 +18,7 @@
 //!   wants `(Y, Cb, Cr, Δ)`, so they are permuted `0312`;
 //! * the coded samples are square-root companded rather than sensor values,
 //!   and are decompanded at the very end as `x = (v + V0)² / D + C`, with
-//!   `V0 = 16158`, `D = 191488` and `C = 1050`, and below a toe as the
+//!   `V0 = 16158`, `D = 191488` and `C = 1018`, and below a toe as the
 //!   straight line tangent to that square, which passes through the 1008
 //!   black level at `v = -V0` and continues below it (see [`NLT_TOE`]);
 //!   clamped to the component depth. That replaces the standard linear
@@ -28,9 +28,9 @@
 //!
 //! The chroma gains and the three companding constants are fitted against
 //! lossless shots of a single scene rather than read from the stream, so they
-//! are probably about right rather than exact; the toe is fitted to the dark
-//! end of a set of Z6 III frames. Whether they hold for other cameras is
-//! untested.
+//! are probably about right rather than exact; `C` and the toe are fitted to
+//! the dark end of a set of Z6 III frames (see [`NLT_C`]). Whether they hold
+//! for other cameras is untested.
 
 use super::header::Header;
 use crate::RawlerError;
@@ -44,7 +44,17 @@ const CR_GAIN: i64 = 4178; // 1.0200
 /// `sqrt((x - C) * D) - V0`, level-shifted to an ordinary 14-bit sample.
 const NLT_V0: i64 = 16158;
 const NLT_D: i64 = 191488;
-const NLT_C: i64 = 1050;
+/// Fitted, not read from the stream. The single-scene fit put it at 1050,
+/// which left everything from black to about 1000 DN above it lifted by 20
+/// to 35 DN in all channels. That shows as a magenta cast in the shadows
+/// once white balance scales R and B. Measured on a Z6 III set against the
+/// camera's own embedded JPEG: flat blocks the camera rendered neutral must
+/// come out neutral after white balance at every level from 45 to 600 DN
+/// above black. That gives C = 1018 (68% range 1016 to 1022). The noise
+/// near black agrees independently: the toe's slope at black that C implies,
+/// 0.0145 DN a code, matches the 0.015 that HE noise against lossless noise
+/// at the same ISO calls for.
+const NLT_C: i64 = 1018;
 
 /// Where the square hands over to a straight line, in `t = v + V0`.
 ///
@@ -55,12 +65,9 @@ const NLT_C: i64 = 1050;
 /// extended non-linearity, whose middle piece is linear and meets the
 /// quadratic above it with a matching slope. Below `NLT_TOE` the decoder
 /// follows the tangent to the square at `NLT_TOE`, down through zero and
-/// below. `NLT_TOE` is fitted, not read from the stream: it is the one
-/// tangent that passes through the 1008 black level at `t = 0`
-/// (`NLT_TOE² = D (C - 1008)`), and with it the darkest tiles of night
-/// frames at ISO 100 to 40000 average 999 to 1016 with no skew, where the
-/// clamp at `t = 0` left them at 1051 to 1103.
-const NLT_TOE: i64 = 2836;
+/// below. `NLT_TOE` follows from `NLT_C`: it is the one tangent that passes
+/// through the 1008 black level at `t = 0` (`NLT_TOE² = D (C - 1008)`).
+const NLT_TOE: i64 = 1384;
 
 /// Displacement of each spec-order component on the CFA grid (ISO/IEC 21122-1
 /// Table F.10, CFA pattern type 0): `(Δx, Δy)` for `(Y, Cb, Cr, Δ)`.
@@ -268,20 +275,22 @@ mod tests {
 
   #[test]
   fn decompands_known_values() {
-    // v = 0 sits near mid-grey: (16158² + 95744) / 191488 + 1050.
-    assert_eq!(decompand(0, 16383), 2413);
+    // v = 0 sits near mid-grey: (16158² + 95744) / 191488 + 1018.
+    assert_eq!(decompand(0, 16383), 2381);
     // The square's zero, t = 0, is black on the toe's line.
     assert_eq!(decompand(-16158, 16383), 1008);
     // The toe: square and line meet at t = NLT_TOE, C + TOE² / D.
-    assert_eq!(decompand((NLT_TOE - NLT_V0) as i32, 16383), 1092);
-    // Below black the line goes on, 0.0296 DN a step, and stops at 0.
-    assert_eq!(decompand(-16158 - 10_000, 16383), 712);
+    assert_eq!(decompand((NLT_TOE - NLT_V0) as i32, 16383), 1028);
+    // Below black the line goes on, 0.0145 DN a step, and stops at 0.
+    assert_eq!(decompand(-16158 - 10_000, 16383), 863);
     assert_eq!(decompand(-100_000, 16383), 0);
     // Large values clamp to the component depth.
     assert_eq!(decompand(100_000, 16383), 16383);
     // The largest value that still decompands below the clamp.
-    assert_eq!(decompand(38_026, 16383), 16382);
-    assert_eq!(decompand(38_027, 16383), 16383);
+    assert_eq!(decompand(38_083, 16383), 16382);
+    assert_eq!(decompand(38_084, 16383), 16383);
+    // The toe passes through black at t = 0 by construction.
+    assert!((NLT_TOE * NLT_TOE - NLT_D * (NLT_C - 1008)).abs() < 2 * NLT_TOE);
   }
 
   #[test]
@@ -298,7 +307,7 @@ mod tests {
       seen[x as usize] = true;
       last = x;
     }
-    assert!(seen[..1093].iter().all(|&s| s), "a value below the toe is never produced");
+    assert!(seen[..1029].iter().all(|&s| s), "a value below the toe is never produced");
     // Slopes match at the toe: the step over the last 200 codes of the
     // line and the first 200 of the square differ by at most a rounding.
     let toe = (NLT_TOE - NLT_V0) as i32;
